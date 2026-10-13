@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { request as httpsRequest } from "node:https";
 import { Readable } from "node:stream";
 import {
-  createProvider, openAICompletionsApi, createAssistantMessageEventStream,
+  createProvider, openAICompletionsApi, openAIResponsesApi, createAssistantMessageEventStream,
   type AnyModel, type Api, type Model, type Provider, type RefreshModelsContext,
   type StreamOptions, type TranscriptContext,
 } from "@earendil-works/pi-ai/compat";
@@ -28,6 +28,7 @@ type Override = {
   compat?: Model<"openai-completions">["compat"];
 };
 export interface Config {
+  api?: "openai-completions" | "openai-responses";
   id?: string;
   name?: string;
   apiKey?: string;
@@ -49,7 +50,7 @@ function modelId(value: unknown): value is string {
   return typeof value === "string" && Boolean(value.trim()) && value.length <= 512
     && value !== "." && value !== ".." && !/[\x00-\x1f\x7f]/u.test(value);
 }
-export interface ServerConfig extends Config { id: string; name: string }
+export interface ServerConfig extends Config { id: string; name: string; api: "openai-completions" | "openai-responses" }
 export type SwapModel = AnyModel & { contextPending: boolean; dynamicContext: boolean };
 type PrepareOptions = { signal?: AbortSignal; apiKey?: string; fetch?: Fetch; force?: boolean };
 export interface LlamaSwapProvider extends Provider {
@@ -58,12 +59,13 @@ export interface LlamaSwapProvider extends Provider {
   onModelPrepared?: (model: SwapModel) => Promise<void>;
 }
 function validateConfig(value: unknown): ServerConfig {
-  if (!record(value) || Object.keys(value).some(key => !["id", "name", "apiKey", "apiKeyEnv", "tlsVerify", "loadTimeoutMs", "baseUrl", "timeoutMs", "defaultMaxTokens", "modelOverrides"].includes(key))) {
+  if (!record(value) || Object.keys(value).some(key => !["id", "name", "api", "apiKey", "apiKeyEnv", "tlsVerify", "loadTimeoutMs", "baseUrl", "timeoutMs", "defaultMaxTokens", "modelOverrides"].includes(key))) {
     throw new Error("Invalid llama-swap configuration fields");
   }
   if (typeof value.baseUrl !== "string" || !positive(value.timeoutMs) || !positive(value.defaultMaxTokens) || !record(value.modelOverrides)) {
     throw new Error("llama-swap needs baseUrl, positive timeoutMs/defaultMaxTokens, and modelOverrides");
   }
+  if (Object.hasOwn(value, "api") && value.api !== "openai-completions" && value.api !== "openai-responses") throw new Error("Invalid llama-swap chat API");
   if (value.timeoutMs > MAX_TIMEOUT_MS) throw new Error("timeoutMs exceeds the timer limit");
   const id = value.id ?? ID;
   const name = value.name ?? id;
@@ -89,6 +91,7 @@ function validateConfig(value: unknown): ServerConfig {
     if (override.compat !== undefined) {
       if (!record(override.compat)) throw new Error("compat must be an object");
       for (const [key, setting] of Object.entries(override.compat)) {
+        if (value.api === "openai-responses" && key !== "supportsDeveloperRole") throw new Error("Unsupported Responses compat override field");
         if (["supportsStore", "supportsDeveloperRole", "supportsReasoningEffort"].includes(key)) {
           if (typeof setting !== "boolean") throw new Error("compat flag must be boolean");
         } else if (key === "maxTokensField") {
@@ -97,7 +100,7 @@ function validateConfig(value: unknown): ServerConfig {
       }
     }
   }
-  return { ...value, id, name, tlsVerify: value.tlsVerify ?? true, loadTimeoutMs: value.loadTimeoutMs ?? 120000,
+  return { ...value, id, name, api: value.api ?? "openai-completions", tlsVerify: value.tlsVerify ?? true, loadTimeoutMs: value.loadTimeoutMs ?? 120000,
     baseUrl: value.baseUrl.replace(/\/+$/u, ""),
     apiKeyEnv: value.apiKeyEnv ?? (value.id === undefined && value.apiKey === undefined ? "LLAMA_SWAP_API_KEY" : undefined),
   } as unknown as ServerConfig;
@@ -105,7 +108,7 @@ function validateConfig(value: unknown): ServerConfig {
 export function parseConfig(value: unknown): ServerConfig[] {
   if (!record(value)) throw new Error("Invalid llama-swap configuration");
   if (!Object.hasOwn(value, "servers")) {
-    if (Object.keys(value).some(key => !["apiKey", "tlsVerify", "loadTimeoutMs", "baseUrl", "timeoutMs", "defaultMaxTokens", "modelOverrides"].includes(key))) throw new Error("Invalid legacy llama-swap configuration fields");
+    if (Object.keys(value).some(key => !["api", "apiKey", "tlsVerify", "loadTimeoutMs", "baseUrl", "timeoutMs", "defaultMaxTokens", "modelOverrides"].includes(key))) throw new Error("Invalid legacy llama-swap configuration fields");
     return [validateConfig(value)];
   }
   if (Object.keys(value).length !== 1 || !Array.isArray(value.servers) || value.servers.length === 0) throw new Error("Configure only a non-empty servers list, or the legacy single-server fields");
@@ -222,7 +225,7 @@ export function mapCatalog(body: unknown, config: Config): SwapModel[] {
     } else {
       const inputs: ("text" | "image")[] = ["text"];
       if (Array.isArray(architecture.input_modalities) && architecture.input_modalities.includes("image")) inputs.push("image");
-      models.push({ ...common, type: "chat", api: "openai-completions", baseUrl: `${config.baseUrl}/v1`, input: inputs,
+      models.push({ ...common, type: "chat", api: config.api ?? "openai-completions", baseUrl: `${config.baseUrl}/v1`, input: inputs,
         reasoning: override.reasoning ?? false, maxTokens: Math.min(override.maxTokens ?? config.defaultMaxTokens, contextWindow), compat: override.compat });
     }
   }
@@ -242,7 +245,7 @@ function untilAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
 export function createLlamaSwapProvider(rawConfig: Config, fetchImpl?: Fetch): LlamaSwapProvider {
   const config = validateConfig(rawConfig);
   const transport = fetchImpl ?? serverFetch(config);
-  const chatApi = openAICompletionsApi();
+  const chatApi = config.api === "openai-responses" ? openAIResponsesApi() : openAICompletionsApi();
   let catalog: SwapModel[] = [];
   let preparedId: string | undefined;
   let lease: Promise<void> = Promise.resolve();
@@ -345,15 +348,20 @@ export function createLlamaSwapProvider(rawConfig: Config, fetchImpl?: Fetch): L
     void withLease(async () => {
       const resolved = await resolveRuntime(model, { ...options, force: true });
       if (resolved.type !== "chat") throw new Error("llama-swap model is a classifier, not a chat model");
+      const responses = config.api === "openai-responses";
+      const maxTokens = Math.min(options?.maxTokens ?? resolved.maxTokens, resolved.maxTokens, resolved.contextWindow);
+      // Pi 1.2.0 raises Responses limits below 16. Do not exceed the caller or model budget.
+      if (responses && (!positive(maxTokens) || maxTokens < 16)) throw new Error("Invalid Responses output budget");
       const requestOptions = { ...options, fetch: options?.fetch ?? transport,
-        ...(needsPreparation(model) ? { maxTokens: Math.min(options?.maxTokens ?? resolved.maxTokens, resolved.maxTokens) } : {}) };
-      const inner = simple ? chatApi.streamSimple(model, context, requestOptions)
-        : chatApi.stream(model, context, requestOptions);
+        ...(responses || needsPreparation(model) ? { maxTokens } : {}) };
+      const requestModel = model.api === config.api ? model : { ...model, api: config.api };
+      const inner = simple ? chatApi.streamSimple(requestModel, context, requestOptions)
+        : chatApi.stream(requestModel, context, requestOptions);
       for await (const event of inner) output.push(event);
       output.end(await inner.result());
     }, options?.signal).catch(() => {
       const reason = options?.signal?.aborted ? "aborted" : "error";
-      output.push({ type: "error", reason, error: { role: "assistant", content: [], api: model.api,
+      output.push({ type: "error", reason, error: { role: "assistant", content: [], api: config.api,
         provider: model.provider, model: model.id, timestamp: Date.now(), stopReason: reason,
         errorMessage: reason === "aborted" ? "llama-swap request cancelled" : "llama-swap request preparation failed",
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { ...ZERO_COST, total: 0 } } } });

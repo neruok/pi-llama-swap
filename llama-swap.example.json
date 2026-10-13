@@ -4,6 +4,7 @@
       "id": "llama-swap-local",
       "name": "Local llama-swap",
       "baseUrl": "http://127.0.0.1:8080",
+      "api": "openai-completions",
       "timeoutMs": 3000,
       "loadTimeoutMs": 120000,
       "defaultMaxTokens": 4096,

@@ -47,6 +47,7 @@ The top-level object contains a non-empty `servers` array:
       "id": "llama-swap-gpu",
       "name": "GPU server",
       "baseUrl": "https://gpu.example.com/llama-swap",
+      "api": "openai-responses",
       "apiKeyEnv": "GPU_SWAP_API_KEY"
     }
   ]
@@ -62,6 +63,7 @@ Reverse-proxy path prefixes are supported. URL credentials, queries, and fragmen
 | `id` | Required provider ID in a servers entry |
 | `name` | Display name, defaults to the ID |
 | `baseUrl` | Required HTTP(S) server root |
+| `api` | Chat API: `openai-completions` (default) or `openai-responses` |
 | `apiKey` | Optional literal API key stored in this configuration file |
 | `apiKeyEnv` | Optional environment variable name, instead of `apiKey` |
 | `tlsVerify` | Boolean certificate verification toggle, defaults to `true` |
@@ -120,7 +122,7 @@ The insecure transport rejects redirects and compressed responses. It requests u
 A caller-supplied `fetch` owns its transport policy instead.
 Omission means `true`. Null and non-boolean values are invalid.
 
-The legacy single-server object also accepts `tlsVerify` and `loadTimeoutMs`, with the same defaults and validation.
+The legacy single-server object also accepts `api`, `tlsVerify`, and `loadTimeoutMs`, with the same defaults and validation.
 `loadTimeoutMs` must be an integer from 1 to 2147483647 milliseconds.
 It defaults to provider ID `llama-swap` and, without `apiKey`, environment variable `LLAMA_SWAP_API_KEY`.
 Use the servers format for an explicitly keyless server.
@@ -196,15 +198,25 @@ Failed preparation sends no inference. Select another model or retry after corre
 A failed refresh keeps the last published catalog for that process.
 Catalogs are not saved across restarts.
 
-Chat uses Pi's OpenAI Chat Completions adapter at `<root>/v1`.
-The backend must support that protocol, including Pi's tool-call format.
+Each server selects its chat API with `api`. Omission uses `openai-completions` and sends requests to `<root>/v1/chat/completions`.
+Set `api` to `openai-responses` to use Pi's Responses adapter at `<root>/v1/responses`.
+The backend must support the selected protocol, including its tool-call format. The extension does not fall back to another API.
+Different server entries can use different APIs. API selection does not change discovery, preparation, or native classifier routes.
+Only the two exact API names are valid. Null, blank strings, and non-string values fail validation.
+Model overrides cannot select an API. Change the provider entry, then run `/reload`.
+
+Responses requests respect the caller limit, model output ceiling, and resolved context window.
+Pi 1.2.0 raises Responses output limits below 16 tokens to 16. The extension blocks budgets below 16 instead of exceeding them.
+Missing or invalid output budgets also fail before inference. Completion requests retain their existing small-budget behavior.
+Caller payload replacements can change these limits and remain caller-owned.
 Chat output never exceeds the context limit. Reasoning defaults to false.
 Image input requires advertised image capability.
 The extension reports token usage when the backend supplies it.
 Prices are zero because the discovery response does not establish billing prices.
 
-Supported `compat` override fields are `supportsStore`, `supportsDeveloperRole`, `supportsReasoningEffort`, and `maxTokensField`.
+For `openai-completions`, supported `compat` fields are `supportsStore`, `supportsDeveloperRole`, `supportsReasoningEffort`, and `maxTokensField`.
 The last field accepts `max_tokens` or `max_completion_tokens`.
+For `openai-responses`, only the shared `supportsDeveloperRole` field is supported. Completion-only fields fail validation.
 Set compatibility flags only after verifying your backend.
 
 ## Native classifiers
@@ -310,6 +322,20 @@ The SDK tests cover startup, resume, reload, selection, failed input, custom tur
 They observe fitted metadata before the next-turn budget check and before a persisted compaction summary.
 Request checks cover refitting, context ceilings, aliases, cancellation, deadlines, complete-response leases, caller transports, and credential isolation.
 
+The provider API selection change passed TypeScript checks and all 89 tests on Pi 1.2.0.
+The first 12 changed-behavior checks failed before implementation. Three preservation checks passed before and after implementation.
+Two additional regressions exposed stale API annotations and invalid static output budgets. Both failed before their fixes and passed afterward.
+Tests cover both config formats, mixed providers, both stream entrypoints, request hooks, tools, usage, dynamic context, cancellation, and output limits.
+
+| Criterion | Before implementation | Final result |
+| --- | --- | --- |
+| AC-API-1 | 3 changed-behavior failures | 3 tests passed |
+| AC-API-2 | 5 changed-behavior failures, then 1 annotation regression failure | 6 tests passed |
+| AC-API-3 | 3 changed-behavior failures | 3 tests passed |
+| AC-API-4 | 3 preservation passes and 72 existing passes | 75 tests passed |
+| AC-API-5 | 2 changed-behavior failures, then 1 invalid-budget regression failure | 3 tests passed |
+
+The mixed-provider test covers AC-API-1 and AC-API-2, so the table counts it in both rows.
 These checks use synthetic discovery, SSE chat, and System One responses with the installed Pi adapters.
 They do not establish live model compatibility, classifier accuracy, or server swapping behavior.
 The unrelated profile-extension check scripts were not run because this task did not change those extensions.
