@@ -1,0 +1,22 @@
+{
+  "servers": [
+    {
+      "id": "llama-swap-local",
+      "name": "Local llama-swap",
+      "baseUrl": "http://127.0.0.1:8080",
+      "timeoutMs": 3000,
+      "loadTimeoutMs": 120000,
+      "defaultMaxTokens": 4096,
+      "modelOverrides": {
+        "text-model": {
+          "fallbackContextWindow": 32768
+        },
+        "judge": {
+          "type": "classifier",
+          "fallbackContextWindow": 32768,
+          "upstreamModelId": "judge"
+        }
+      }
+    }
+  ]
+}
