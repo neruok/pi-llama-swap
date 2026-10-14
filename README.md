@@ -2,8 +2,17 @@
 
 Register named llama-swap servers as Pi providers. Discover chat models and native System One classifiers from each server.
 
-This is an unpublished package, validated with Pi 1.2.0.
+Validated with Pi 1.2.0. The host peer range is `^1.2.0`. Licensed under [MIT](LICENSE).
 Loading and inference tests use synthetic servers. Live inference has not been verified.
+
+## Install
+
+```sh
+pi install npm:@neruok/pi-llama-swap
+```
+
+Copy `llama-swap.example.json` to `<Pi agent directory>/llama-swap.json`, set your server URLs and model IDs, then run `/reload`.
+You can instead set `LLAMA_SWAP_CONFIG` to an absolute configuration path before starting Pi.
 
 ## Try the extension
 
@@ -56,7 +65,8 @@ The top-level object contains a non-empty `servers` array:
 
 Each ID must be unique. Use `llama-swap` or `llama-swap-<lowercase-name>`.
 Servers can share model IDs without sharing credentials or catalogs.
-Reverse-proxy path prefixes are supported. URL credentials, queries, and fragments are prohibited.
+Reverse-proxy path prefixes are supported. URL credentials, queries, and fragments are prohibited, including empty trailing `?` or `#`.
+Percent-encoded delimiters in the path remain valid.
 
 | Field | Meaning |
 | --- | --- |
@@ -64,6 +74,7 @@ Reverse-proxy path prefixes are supported. URL credentials, queries, and fragmen
 | `name` | Display name, defaults to the ID |
 | `baseUrl` | Required HTTP(S) server root |
 | `api` | Chat API: `openai-completions` (default) or `openai-responses` |
+| `parallelToolCalls` | Optional boolean for every chat model on this server. Omission preserves existing behavior |
 | `apiKey` | Optional literal API key stored in this configuration file |
 | `apiKeyEnv` | Optional environment variable name, instead of `apiKey` |
 | `tlsVerify` | Boolean certificate verification toggle, defaults to `true` |
@@ -122,7 +133,7 @@ The insecure transport rejects redirects and compressed responses. It requests u
 A caller-supplied `fetch` owns its transport policy instead.
 Omission means `true`. Null and non-boolean values are invalid.
 
-The legacy single-server object also accepts `api`, `tlsVerify`, and `loadTimeoutMs`, with the same defaults and validation.
+The legacy single-server object also accepts `api`, `parallelToolCalls`, `tlsVerify`, and `loadTimeoutMs`, with the same defaults and validation.
 `loadTimeoutMs` must be an integer from 1 to 2147483647 milliseconds.
 It defaults to provider ID `llama-swap` and, without `apiKey`, environment variable `LLAMA_SWAP_API_KEY`.
 Use the servers format for an explicitly keyless server.
@@ -205,11 +216,54 @@ Different server entries can use different APIs. API selection does not change d
 Only the two exact API names are valid. Null, blank strings, and non-string values fail validation.
 Model overrides cannot select an API. Change the provider entry, then run `/reload`.
 
+To request one tool call per model response, add `"parallelToolCalls": false` to the affected server entry, then run `/reload`.
+Set it to `true` to explicitly allow parallel tool calls.
+This setting sends `parallel_tool_calls` for both Chat Completions and Responses, for every chat model on that server.
+Omission preserves the adapter, model, and caller settings. Null and non-boolean values fail validation.
+Model overrides cannot specify `parallelToolCalls`.
+An explicit server value overrides model and request `samplingParams.parallel_tool_calls`. Other sampling values remain unchanged.
+Existing `onPayload` hooks retain final control and can change or remove the field.
+The backend must honor the request. This setting does not serialize tool execution or repair malformed response events.
+It does not change discovery, preparation, or native classifier requests.
+
 Responses requests respect the caller limit, model output ceiling, and resolved context window.
 Pi 1.2.0 raises Responses output limits below 16 tokens to 16. The extension blocks budgets below 16 instead of exceeding them.
 Missing or invalid output budgets also fail before inference. Completion requests retain their existing small-budget behavior.
 Caller payload replacements can change these limits and remain caller-owned.
-Chat output never exceeds the context limit. Reasoning defaults to false.
+Chat output never exceeds the context limit.
+During selected-model preparation, llama.cpp models enable Pi thinking controls when `/props` reports `chat_template_caps.supports_reasoning_effort: true`.
+An explicit `modelOverrides` reasoning boolean takes precedence, including `false`.
+Missing or malformed capabilities default to `false`. Fresh preparation replaces the previous detected value.
+Detection uses the existing metadata request. It does not probe during discovery or infer support from model names or template text.
+Static models and other backends retain the explicit override or default to `false`.
+This metadata declares template effort support, not a guarantee that the model generates thoughts or honors each requested level.
+After updating the extension, run `/reload` to prepare the current model with the new detection.
+
+Set `thinkingLevelMap` in a model override when the backend accepts different effort values than Pi:
+
+```json
+{
+  "modelOverrides": {
+    "Qwen3.8-27b": {
+      "thinkingLevelMap": {
+        "minimal": null,
+        "high": "xhigh"
+      }
+    }
+  }
+}
+```
+
+A null value hides a Pi level. A string translates that level to the backend value for both chat APIs.
+This example removes `minimal` and sends `xhigh` for Pi's `high` level.
+Pi clamps a simple request for the hidden `minimal` level to `low`. Raw stream callers must select supported levels themselves.
+Valid keys are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
+A supplied map must be an object. Values must be null or nonblank strings without ASCII controls.
+Unknown keys, arrays, null maps, and other value types fail validation. An empty map preserves Pi defaults.
+The map does not enable reasoning by itself. Configure it only from verified backend behavior.
+Omission keeps existing defaults. Final payload hooks retain control over the request fields.
+Run `/reload` after a configuration change.
+
 Image input requires advertised image capability.
 The extension reports token usage when the backend supplies it.
 Prices are zero because the discovery response does not establish billing prices.
@@ -268,6 +322,9 @@ A discovery catalog has at most 1000 entries.
 Malformed metadata, duplicate IDs, unexpected classifier identities, and cancelled calls fail without guessed capabilities.
 Classifier failures use fixed messages instead of raw server errors.
 Other servers can still refresh successfully.
+Cancellation retains the active Pi adapter's partial content and any reported token usage.
+A cancelled queued request performs no HTTP. The server lease stays held until the active operation finishes.
+A caller-supplied transport that ignores cancellation can delay completion.
 `PI_OFFLINE=1` disables discovery, but it does not disable explicit inference calls.
 
 The generated contract is in [docs/pi-llama-swap.md](docs/pi-llama-swap.md).
@@ -275,16 +332,19 @@ The workspace documentation store owns that file. Do not edit it directly.
 
 ## Verify
 
-Use the host-supplied Pi packages. Do not bundle a second Pi runtime.
-Dynamic preparation is validated with Pi 1.2.0. Older versions have not been checked for this behavior.
-Validation uses Node 24 and the installed TypeScript compiler.
+Runtime Pi packages are host-supplied. Do not bundle a second Pi runtime.
+Development uses pinned Pi 1.2.0, TypeScript, and Node types from `package-lock.json`; no global compiler or SDK symlinks are needed.
+Use Node 24, npm, `tar`, and `openssl` for verification. Older Pi versions have not been checked.
 
 ```sh
+npm ci --ignore-scripts
 npm run verify
 ```
 
 The project uses Node's built-in test runner. It has no runtime dependencies.
-The package loader test uses the installed Pi loader with a private temporary agent directory.
+Verification includes strict typechecking, all regression tests, and the actual npm archive loaded with the host SDK and an isolated temporary configuration.
+The archive gate checks its file list and bytes and rejects bundled dependencies.
+CI runs the same checks and `npm publish --dry-run`. The `prepublishOnly` hook runs verification before publication.
 
 ### Acceptance results
 
@@ -338,4 +398,34 @@ Tests cover both config formats, mixed providers, both stream entrypoints, reque
 The mixed-provider test covers AC-API-1 and AC-API-2, so the table counts it in both rows.
 These checks use synthetic discovery, SSE chat, and System One responses with the installed Pi adapters.
 They do not establish live model compatibility, classifier accuracy, or server swapping behavior.
+
+The per-server parallel-tool setting passed `npm run verify` with Pi 1.2.0 and all 96 tests.
+Five new changed-behavior checks failed before implementation because the setting was unsupported. Two new preservation checks passed before and after implementation.
+All 89 existing tests passed before and after implementation.
+AC-PARALLEL-1 through AC-PARALLEL-4 cover both configuration formats, both chat APIs, both streaming entrypoints, and static and dynamic models.
+They also check provider isolation, sampling precedence, payload hooks, immutable caller options, omission, invalid values, and classifier requests.
+These tests inspect synthetic HTTP request bodies. They do not prove that a live backend honors `parallel_tool_calls`.
+
+Reasoning detection passed `npm run verify` with Pi 1.2.0 and all 106 tests.
+AC-REASONING-1 and AC-REASONING-2 failed before implementation and passed after it. AC-REASONING-3 passed before and after.
+The checks cover both chat APIs, both entrypoints, SDK lifecycle controls, fresh capability changes, explicit overrides, malformed metadata, and failure gates.
+An isolated SDK session also verified thinking controls against the already-loaded Qwen backend with the unchanged live configuration.
+That live check sent metadata requests only. It did not test inference or effort compliance.
+
+Thinking-level mapping passed `npm run verify` with Pi 1.2.0 and all 116 tests.
+AC-THINKING-MAP-1 and AC-THINKING-MAP-2 changed-behavior checks failed before implementation and passed after it.
+Invalid-map rejection and AC-THINKING-MAP-3 preservation checks passed before and after implementation.
+An isolated SDK session verified the approved Qwen configuration with the live backend and no inference request.
+It exposed `off`, `low`, `medium`, and `high`, clamped `minimal` to `low`, and retained `high` to `xhigh` translation.
+Only the user-approved configuration block changed. Live effort compliance and off-mode behavior remain untested.
 The unrelated profile-extension check scripts were not run because this task did not change those extensions.
+
+### Release 0.2.0 checks
+
+The release candidate passed strict typechecking, all 141 tests, and the actual-archive loading gate on Pi 1.2.0 and Node 24.21.0.
+An isolated clean install also passed without global TypeScript or checkout SDK symlinks.
+Before the fixes, eight partial-result checks, one URL-delimiter check, and two development/release-metadata checks failed; ten preservation checks passed.
+Cancellation checks compare both APIs and streaming entrypoints against the installed native adapters, including text, partial tool calls, usage, one terminal outcome, failures, and pre-aborted calls.
+They also check active leases with delayed fetch completion, independent providers, and recovery after metadata failure or timeout.
+The archive gate handles array and keyed-map npm pack output and writes its archive even under an inherited publish dry-run.
+All inference is synthetic. These checks do not establish live backend compatibility or model swapping.

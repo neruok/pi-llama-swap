@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseConfig } from "../llama-swap.ts";
-import { config } from "./helpers.mjs";
+import { parseConfig, createLlamaSwapProvider } from "../llama-swap.ts";
+import { config, listing, chat, refresh } from "./helpers.mjs";
 test("AC-CONFIG preserved: formats, defaults and isolated key names", () => {
   const legacy = config(); delete legacy.id;
   assert.equal(parseConfig(legacy)[0].apiKeyEnv, "LLAMA_SWAP_API_KEY");
@@ -23,6 +23,29 @@ test("AC-CONFIG preserved: invalid input and unknown fields fail", () => {
     { servers: [{ ...config(), modelOverrides: { x: { compat: { unverified: true } } } }] },
     { servers: [{ ...config(), name: "\u001b[31m" }] },
   ]) assert.throws(() => parseConfig(value));
+});
+test("AC-CONFIG regression: empty query and fragment delimiters fail before HTTP in both formats", () => {
+  for (const suffix of ["?", "#", "?x=1", "#fragment", "?#"]) {
+    const cfg = config({ baseUrl: `https://swap.invalid/prefix${suffix}` });
+    const legacy = { ...cfg }; delete legacy.id;
+    assert.throws(() => parseConfig(legacy));
+    assert.throws(() => parseConfig({ servers: [cfg] }));
+    let calls = 0;
+    assert.throws(() => createLlamaSwapProvider(cfg, async () => { calls++; return Response.json(listing(chat())); }));
+    assert.equal(calls, 0);
+  }
+});
+test("AC-CONFIG preserved: encoded delimiters retain the reverse-proxy path", async () => {
+  const cfg = config({ baseUrl: "https://swap.invalid/prefix%3F%23/" });
+  const [parsed] = parseConfig({ servers: [cfg] });
+  let observed;
+  const provider = createLlamaSwapProvider(parsed, async url => {
+    observed = new URL(url);
+    return Response.json(listing(chat()));
+  });
+  await refresh(provider);
+  assert.equal(observed.pathname, "/prefix%3F%23/v1/models");
+  assert.equal(observed.search, ""); assert.equal(observed.hash, "");
 });
 test("AC-CONFIG changed: explicit upstream IDs are accepted", () => {
   const [c] = parseConfig({ servers: [config({ modelOverrides: { judge: { upstreamModelId: "gguf-name" } } })] });

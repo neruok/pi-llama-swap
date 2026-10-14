@@ -21,6 +21,7 @@ type RecordValue = Record<string, unknown>;
 type Override = {
   type?: "chat" | "classifier" | "ignore";
   reasoning?: boolean;
+  thinkingLevelMap?: Model<"openai-completions">["thinkingLevelMap"];
   maxTokens?: number;
   contextWindow?: number;
   fallbackContextWindow?: number;
@@ -29,6 +30,7 @@ type Override = {
 };
 export interface Config {
   api?: "openai-completions" | "openai-responses";
+  parallelToolCalls?: boolean;
   id?: string;
   name?: string;
   apiKey?: string;
@@ -59,7 +61,7 @@ export interface LlamaSwapProvider extends Provider {
   onModelPrepared?: (model: SwapModel) => Promise<void>;
 }
 function validateConfig(value: unknown): ServerConfig {
-  if (!record(value) || Object.keys(value).some(key => !["id", "name", "api", "apiKey", "apiKeyEnv", "tlsVerify", "loadTimeoutMs", "baseUrl", "timeoutMs", "defaultMaxTokens", "modelOverrides"].includes(key))) {
+  if (!record(value) || Object.keys(value).some(key => !["id", "name", "api", "apiKey", "apiKeyEnv", "tlsVerify", "parallelToolCalls", "loadTimeoutMs", "baseUrl", "timeoutMs", "defaultMaxTokens", "modelOverrides"].includes(key))) {
     throw new Error("Invalid llama-swap configuration fields");
   }
   if (typeof value.baseUrl !== "string" || !positive(value.timeoutMs) || !positive(value.defaultMaxTokens) || !record(value.modelOverrides)) {
@@ -77,14 +79,24 @@ function validateConfig(value: unknown): ServerConfig {
   if (value.apiKey !== undefined && value.apiKeyEnv !== undefined) throw new Error("Configure only one of apiKey or apiKeyEnv");
   if (value.apiKeyEnv !== undefined && (typeof value.apiKeyEnv !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(value.apiKeyEnv))) throw new Error("apiKeyEnv must name an environment variable");
   if (Object.hasOwn(value, "tlsVerify") && typeof value.tlsVerify !== "boolean") throw new Error("tlsVerify must be boolean");
+  if (Object.hasOwn(value, "parallelToolCalls") && typeof value.parallelToolCalls !== "boolean") throw new Error("parallelToolCalls must be boolean");
   if (Object.hasOwn(value, "loadTimeoutMs") && (!positive(value.loadTimeoutMs) || value.loadTimeoutMs > MAX_TIMEOUT_MS)) throw new Error("Invalid loadTimeoutMs");
   const url = new URL(value.baseUrl);
-  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error("llama-swap baseUrl must be HTTP(S) without credentials, query, or fragment");
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || /[?#]/u.test(value.baseUrl)) throw new Error("llama-swap baseUrl must be HTTP(S) without credentials, query, or fragment");
   for (const [id, override] of Object.entries(value.modelOverrides)) {
-    if (!modelId(id) || !record(override) || Object.keys(override).some(key => !["type", "reasoning", "maxTokens", "contextWindow", "fallbackContextWindow", "upstreamModelId", "compat"].includes(key))) throw new Error("Invalid llama-swap model override");
+    if (!modelId(id) || !record(override) || Object.keys(override).some(key => !["type", "reasoning", "thinkingLevelMap", "maxTokens", "contextWindow", "fallbackContextWindow", "upstreamModelId", "compat"].includes(key))) throw new Error("Invalid llama-swap model override");
     if (override.upstreamModelId !== undefined && !modelId(override.upstreamModelId)) throw new Error("Invalid upstream model ID");
     if (override.type !== undefined && (typeof override.type !== "string" || !["chat", "classifier", "ignore"].includes(override.type))) throw new Error("Invalid model type override");
     if (override.reasoning !== undefined && typeof override.reasoning !== "boolean") throw new Error("reasoning must be boolean");
+    if (Object.hasOwn(override, "thinkingLevelMap")) {
+      if (!record(override.thinkingLevelMap)) throw new Error("thinkingLevelMap must be an object");
+      for (const [level, effort] of Object.entries(override.thinkingLevelMap)) {
+        if (!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(level)
+            || (effort !== null && (typeof effort !== "string" || !effort.trim() || /[\x00-\x1f\x7f]/u.test(effort)))) {
+          throw new Error("Invalid thinkingLevelMap entry");
+        }
+      }
+    }
     for (const key of ["maxTokens", "contextWindow", "fallbackContextWindow"]) {
       if (override[key] !== undefined && !positive(override[key])) throw new Error(`${key} must be positive`);
     }
@@ -108,7 +120,7 @@ function validateConfig(value: unknown): ServerConfig {
 export function parseConfig(value: unknown): ServerConfig[] {
   if (!record(value)) throw new Error("Invalid llama-swap configuration");
   if (!Object.hasOwn(value, "servers")) {
-    if (Object.keys(value).some(key => !["api", "apiKey", "tlsVerify", "loadTimeoutMs", "baseUrl", "timeoutMs", "defaultMaxTokens", "modelOverrides"].includes(key))) throw new Error("Invalid legacy llama-swap configuration fields");
+    if (Object.keys(value).some(key => !["api", "apiKey", "tlsVerify", "parallelToolCalls", "loadTimeoutMs", "baseUrl", "timeoutMs", "defaultMaxTokens", "modelOverrides"].includes(key))) throw new Error("Invalid legacy llama-swap configuration fields");
     return [validateConfig(value)];
   }
   if (Object.keys(value).length !== 1 || !Array.isArray(value.servers) || value.servers.length === 0) throw new Error("Configure only a non-empty servers list, or the legacy single-server fields");
@@ -226,17 +238,20 @@ export function mapCatalog(body: unknown, config: Config): SwapModel[] {
       const inputs: ("text" | "image")[] = ["text"];
       if (Array.isArray(architecture.input_modalities) && architecture.input_modalities.includes("image")) inputs.push("image");
       models.push({ ...common, type: "chat", api: config.api ?? "openai-completions", baseUrl: `${config.baseUrl}/v1`, input: inputs,
-        reasoning: override.reasoning ?? false, maxTokens: Math.min(override.maxTokens ?? config.defaultMaxTokens, contextWindow), compat: override.compat });
+        reasoning: override.reasoning ?? false,
+        thinkingLevelMap: override.thinkingLevelMap === undefined ? undefined : { ...override.thinkingLevelMap },
+        maxTokens: Math.min(override.maxTokens ?? config.defaultMaxTokens, contextWindow), compat: override.compat });
     }
   }
   return models;
 }
-// Cancellation of a queued lease rejects immediately, but the queued work also
-// checks its signal before dispatch. The lease remains held by ongoing I/O.
-function untilAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+// Queued cancellation rejects immediately and prevents dispatch. Once started,
+// signal-aware I/O owns cancellation so its final partial result is preserved.
+// The lease remains held until that I/O settles, even if a transport ignores abort.
+function untilAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined, queued: () => boolean): Promise<T> {
   if (!signal) return promise;
   return new Promise((resolve, reject) => {
-    const abort = () => reject(signal.reason);
+    const abort = () => { if (queued()) reject(signal.reason); };
     signal.addEventListener("abort", abort, { once: true });
     if (signal.aborted) abort();
     promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", abort));
@@ -250,9 +265,10 @@ export function createLlamaSwapProvider(rawConfig: Config, fetchImpl?: Fetch): L
   let preparedId: string | undefined;
   let lease: Promise<void> = Promise.resolve();
   const withLease = <T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> => {
-    const result = lease.then(() => { signal?.throwIfAborted(); return operation(); });
+    let started = false;
+    const result = lease.then(() => { signal?.throwIfAborted(); started = true; return operation(); });
     lease = result.then(() => {}, () => {});
-    return untilAbort(result, signal);
+    return untilAbort(result, signal, () => !started);
   };
   const apiKey = (key?: string, environmentKey?: string) => {
     const selected = key ?? config.apiKey ?? environmentKey;
@@ -316,6 +332,7 @@ export function createLlamaSwapProvider(rawConfig: Config, fetchImpl?: Fetch): L
       const runtimeWindow = llamaCpp ? defaults.n_ctx : [item.context_length, item.context_window, meta.n_ctx].find(positive);
       if (!positive(runtimeWindow)) throw new Error("Missing runtime context");
       const modalities = record(props) && record(props.modalities) ? props.modalities : {};
+      const templateCaps = record(props) && record(props.chat_template_caps) ? props.chat_template_caps : {};
       const architecture = record(item.architecture) ? item.architecture : {};
       let inputs = Array.isArray(architecture.input_modalities) ? [...architecture.input_modalities] : ["text"];
       if (modalities.vision === false) inputs = inputs.filter(input => input !== "image");
@@ -324,7 +341,8 @@ export function createLlamaSwapProvider(rawConfig: Config, fetchImpl?: Fetch): L
       const next = mapCatalog({ data: [{ ...item, id: current.id,
         name: current.name.endsWith(PENDING_SUFFIX) ? current.name.slice(0, -PENDING_SUFFIX.length) : current.name,
         context_length: window, architecture: { ...architecture, input_modalities: inputs }, status: { value: "loaded" } }] },
-      { ...config, modelOverrides: { ...config.modelOverrides, [model.id]: { ...override, contextWindow: window } } })[0];
+      { ...config, modelOverrides: { ...config.modelOverrides, [model.id]: { ...override,
+        reasoning: override.reasoning ?? (templateCaps.supports_reasoning_effort === true), contextWindow: window } } })[0];
       signal.throwIfAborted();
       const latest = catalog.find(entry => entry.id === current.id);
       if (!next || !latest) throw new Error("Runtime model disappeared");
@@ -353,6 +371,9 @@ export function createLlamaSwapProvider(rawConfig: Config, fetchImpl?: Fetch): L
       // Pi 1.2.0 raises Responses limits below 16. Do not exceed the caller or model budget.
       if (responses && (!positive(maxTokens) || maxTokens < 16)) throw new Error("Invalid Responses output budget");
       const requestOptions = { ...options, fetch: options?.fetch ?? transport,
+        ...(config.parallelToolCalls !== undefined ? { samplingParams: {
+          ...options?.samplingParams, parallel_tool_calls: config.parallelToolCalls,
+        } } : {}),
         ...(responses || needsPreparation(model) ? { maxTokens } : {}) };
       const requestModel = model.api === config.api ? model : { ...model, api: config.api };
       const inner = simple ? chatApi.streamSimple(requestModel, context, requestOptions)

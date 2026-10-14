@@ -20,7 +20,7 @@ test("AC-ENTRY package verification: Pi loads the manifest without settings chan
     const manifest = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
     assert.deepEqual(manifest.pi.extensions, ["./llama-swap.ts"]);
     assert.equal(manifest.dependencies, undefined);
-    assert.equal(manifest.peerDependencies["@earendil-works/pi-ai"], "*");
+    assert.equal(manifest.peerDependencies["@earendil-works/pi-ai"], "^1.2.0");
     const loader = new DefaultResourceLoader({
       cwd: dir, agentDir, settingsManager: SettingsManager.inMemory({}),
       additionalExtensionPaths: [packageRoot],
